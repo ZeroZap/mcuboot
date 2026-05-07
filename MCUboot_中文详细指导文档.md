@@ -3620,7 +3620,79 @@ imgtool sign -k mykey.pem --align 4 -v "1.0.0" -H 0x20 \
 
 ## 42. 常见问题 FAQ
 
-### Q1: boot_go() 返回后如何跳转到用户应用?
+### Q1: 裸机移植 MCUboot 用 Mbed TLS 要动态内存分配吗？能用 Tinycrypt 替代吗？
+
+**可以直接用 Tinycrypt，而且裸机更推荐它。**
+
+Mbed TLS 在 MCUboot 的实际使用中，SHA-256 和 ECDSA-P256 路径并不触发内部的 `calloc`/`free`。`mbedtls_sha256_context` 约 224 字节纯结构体，`_init()`/`_free()` 只是清零操作，不走 `malloc`。但官方 PORTING.md 标注了"需要提供 calloc/free"，这是面向 RSA / X.509 等真正需要动态分配的模块。
+
+Tinycrypt 从源码层面就零动态内存：
+
+```
+Tinycrypt SHA-256上下文:  struct tc_sha256_state_struct  (~108字节纯栈结构体)
+Tinycrypt ECDSA上下文:    typedef uintptr_t               (占位符, uECC全栈计算)
+Mbed TLS SHA-256上下文:   mbedtls_sha256_context          (~224字节纯结构体)
+Mbed TLS ECDSA上下文:     mbedtls_ecdsa_context           (含ecp_group/ecp_point/mpi)
+```
+
+**对比：**
+
+| 特性 | Mbed TLS | Tinycrypt |
+|------|---------|-----------|
+| 动态内存需求 | 官方说需要（实际SHA+ECDSA路径不用） | 零动态分配 |
+| SHA-256 FLASH 体积 | ~8KB | ~4KB |
+| ECDSA 验证 FLASH 体积 | ~12KB | ~6KB |
+| 支持签名类型 | RSA / ECDSA / Ed25519(需PSA) | 仅 ECDSA |
+| 支持加密 | RSA-OAEP / AES-KW / ECIES | 无（不支持镜像加密） |
+| 裸机适配复杂度 | 需配置 mbedtls_config.h 裁剪 | 开箱即用 |
+
+**裸机推荐配置：**
+```c
+#define MCUBOOT_USE_TINYCRYPT   // 零动态内存，体积小
+#define MCUBOOT_SIGN_EC256      // ECDSA-P256
+```
+
+### Q2: 裸机移植能用 ED25519 吗？和 Tinycrypt 能搭配吗？
+
+**可以，而且 Tinycrypt + ED25519 是裸机最优组合。**
+
+ED25519 签名验证走的是 MCUboot 内置的独立实现 `ext/fiat/src/curve25519.c`（形式化验证的 fiat-crypto 代码），不依赖 Mbed TLS 也不依赖 Tinycrypt。
+
+职责分离：
+- **SHA-256**（镜像 hash）→ 由 Tinycrypt 提供
+- **ED25519 签名验证** → 由 `ext/fiat/src/curve25519.c` 独立提供
+
+**配置：**
+```c
+#define MCUBOOT_USE_TINYCRYPT    // SHA-256 由 Tinycrypt 提供
+#define MCUBOOT_SIGN_ED25519     // 签名由 ext/fiat/curve25519.c 独立实现
+#define MCUBOOT_OVERWRITE_ONLY   // 裁剪 swap 代码
+```
+
+**构建系统添加：**
+```makefile
+SRC += ext/fiat/src/curve25519.c         # 提供 ED25519_verify()
+SRC += boot/bootutil/src/image_ed25519.c # ED25519 签名验证胶水代码
+# 不需要 image_ecdsa.c, image_rsa.c
+# 不需要 Mbed TLS 的任何 .a 文件
+```
+
+**三种方案对比：**
+
+| 方案 | SHA-256 | 签名 | Flash | RAM | 验证速度 (Cortex-M0+) |
+|------|---------|------|-------|-----|----------------------|
+| Mbed TLS + ECDSA | Mbed TLS | Mbed TLS | ~30KB | ~3KB | 慢 (~1-2s) |
+| Tinycrypt + ECDSA | Tinycrypt | uECC | ~18KB | ~1.5KB | 中等 (~0.5s) |
+| **Tinycrypt + ED25519** | Tinycrypt | fiat-crypto | **~20KB** | **~2KB** | **快 (~0.15s)** |
+
+**注意事项：**
+1. ED25519 公钥是 32 字节原始格式（非 DER），`keys.c` 中格式与 ECDSA 不同
+2. 用 `imgtool keygen -k mykey.pem -t ed25519` 生成密钥
+3. 用 `imgtool getpub -k mykey.pem` 获取 C 数组格式公钥
+4. fiat-crypto 代码是自动生成的，可读性差但经过形式化验证
+5. Tinycrypt 不支持镜像加密，如果你需要加密功能需要换 Mbed TLS 或自实现 backend
+
+### Q3: boot_go() 返回后如何跳转到用户应用?
 
 ```c
 struct boot_rsp rsp;
@@ -3634,28 +3706,28 @@ __set_MSP(sp);
 ((void (*)(void))pc)();
 ```
 
-### Q2: 镜像签名后太大怎么办?
+### Q4: 镜像签名后太大怎么办?
 
 - 检查 `--slot-size` 参数是否考虑了 trailer 大小
 - 使用 Overwrite Only 模式减少 trailer 开销
 - 减小 `MCUBOOT_MAX_IMG_SECTORS` 值
 - 使用 `--pad-header` 而非在链接脚本中预留 header 空间
 
-### Q3: 如何从旧版本升级 MCUboot?
+### Q5: 如何从旧版本升级 MCUboot?
 
 MCUboot 不管理自身的升级。通常需要:
 1. 将新 MCUboot 写入 Flash 起始地址
 2. 使用芯片的 Dual-Bank 或 ROM Bootloader
 3. 或使用外部编程器
 
-### Q4: Swap 中断后如何恢复?
+### Q6: Swap 中断后如何恢复?
 
 MCUboot 设计上支持在 Swap 过程中任意时刻断电。重新上电后:
 1. 检查 Trailer 中的 swap_status 区域
 2. 确定中断位置
 3. 从断点继续 Swap
 
-### Q5: 为什么我的镜像验证失败?
+### Q7: 为什么我的镜像验证失败?
 
 常见原因:
 - Flash 写对齐 (`--align`) 设置不正确
@@ -3664,7 +3736,7 @@ MCUboot 设计上支持在 Swap 过程中任意时刻断电。重新上电后:
 - 镜像实际大小超过了 `slot_size - trailer_size`
 - ECDSA 签名的 padding 问题 (尝试 `--pad-sig` 或 `--no-pad-sig`)
 
-### Q6: 如何在裸机环境下分配 Mbed TLS 的内存?
+### Q8: 如何在裸机环境下分配 Mbed TLS 的内存?
 
 ```c
 // 提供 calloc/free 给 Mbed TLS
@@ -3678,7 +3750,7 @@ int mbedtls_platform_set_calloc_free(
 
 如果堆不可用, 需要使用静态内存池实现 calloc/free。
 
-### Q7: MCUboot 需要多少 RAM?
+### Q9: MCUboot 需要多少 RAM?
 
 典型配置:
 - Swap 模式: ~4-8KB (主要是 swap_status 和临时缓冲区)
@@ -3687,7 +3759,7 @@ int mbedtls_platform_set_calloc_free(
 
 RAM 使用可通过减小 `MCUBOOT_MAX_IMG_SECTORS` 来优化。
 
-### Q8: 如何调试 MCUboot?
+### Q10: 如何调试 MCUboot?
 
 1. **模拟器**: 使用 `sim/` 下的 Rust 模拟器, 可以在 PC 上完整运行和调试
 2. **日志**: 启用 `MCUBOOT_HAVE_LOGGING` 并映射到调试串口
