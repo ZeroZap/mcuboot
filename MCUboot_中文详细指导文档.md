@@ -3654,43 +3654,102 @@ Mbed TLS ECDSA上下文:     mbedtls_ecdsa_context           (含ecp_group/ecp_p
 
 ### Q2: 裸机移植能用 ED25519 吗？和 Tinycrypt 能搭配吗？
 
-**可以，而且 Tinycrypt + ED25519 是裸机最优组合。**
+**可以，而且 Tinycrypt + ED25519 是裸机最优组合——但默认路径有一个隐藏的 Mbed TLS 依赖需要处理。**
 
-ED25519 签名验证走的是 MCUboot 内置的独立实现 `ext/fiat/src/curve25519.c`（形式化验证的 fiat-crypto 代码），不依赖 Mbed TLS 也不依赖 Tinycrypt。
+#### 架构全景
 
-职责分离：
-- **SHA-256**（镜像 hash）→ 由 Tinycrypt 提供
-- **ED25519 签名验证** → 由 `ext/fiat/src/curve25519.c` 独立提供
+ED25519 涉及两个独立子系统和两个独立依赖：
 
-**配置：**
+```
+                     ┌──────────────────────────────┐
+                     │     MCUBOOT_SIGN_ED25519      │
+                     └──────────────┬───────────────┘
+                                    │
+            ┌───────────────────────┼───────────────────────┐
+            ▼                       ▼                       ▼
+   ┌─────────────────┐   ┌──────────────────────┐   ┌──────────────┐
+   │ curve25519.c    │   │  image_ed25519.c     │   │   sha.h      │
+   │ (椭圆曲线数学)   │   │  (签名验证胶水)       │   │ (镜像哈希)    │
+   │                 │   │                      │   │              │
+   │ SHA-512:        │   │ 公钥解析:             │   │ SHA-256:     │
+   │  ├─ Mbed TLS ✅ │   │  默认: mbedtls ASN.1 │   │  可选任意后端 │
+   │  └─ TinyCrypt ✅│   │  绕过: BYPASS_ASN    │   │              │
+   │  (ext/tinycrypt │   │  替代: BUILTIN_KEY   │   │              │
+   │   -sha512)      │   │                      │   │              │
+   └─────────────────┘   └──────────────────────┘   └──────────────┘
+```
+
+#### 第一层：`curve25519.c`（ED25519 数学运算）— 没有问题
+
+`ext/fiat/src/curve25519.c` 已经内置了 SHA-512 双路径：
+
 ```c
-#define MCUBOOT_USE_TINYCRYPT    // SHA-256 由 Tinycrypt 提供
-#define MCUBOOT_SIGN_ED25519     // 签名由 ext/fiat/curve25519.c 独立实现
-#define MCUBOOT_OVERWRITE_ONLY   // 裁剪 swap 代码
+#if defined(MCUBOOT_USE_MBED_TLS)
+#include <mbedtls/sha512.h>       // Mbed TLS 的 SHA-512
+#else
+#include <tinycrypt/sha512.h>      // ext/tinycrypt-sha512 扩展
+#endif
+```
+
+选 Tinycrypt 后端时自动走 Tinycrypt SHA-512。这一层无 Mbed TLS 依赖。
+
+#### 第二层：`image_ed25519.c`（签名验证胶水）— 这里有坑
+
+```c
+// boot/bootutil/src/image_ed25519.c，第 16-20 行
+#if !defined(MCUBOOT_BUILTIN_KEY) && !defined(MCUBOOT_KEY_IMPORT_BYPASS_ASN)
+/* We are not really using the MBEDTLS but need the ASN.1 parsing functions */
+#define MBEDTLS_ASN1_PARSE_C
+#include "mbedtls/oid.h"
+#include "mbedtls/asn1.h"           // ← 解析公钥的 DER 编码
+```
+
+**默认路径无条件 include 了 Mbed TLS 的 ASN.1 头文件。** 原因是 `imgtool getpub` 输出的 ED25519 公钥是 DER SubjectPublicKeyInfo 格式，MCUboot 需要解析它来提取 32 字节原始公钥。
+
+#### 三种路径对比
+
+| 路径 | 需要 Mbed TLS? | 说明 |
+|------|:---:|------|
+| 默认 ED25519 | **部分** | 仅需 ASN.1 解析器（`mbedtls/asn1.h`、`mbedtls/oid.h`），不需加密/大数 |
+| `MCUBOOT_KEY_IMPORT_BYPASS_ASN` | **否** | 裸机最优解：跳过 ASN.1，公钥取 DER 末尾 32 字节 |
+| `MCUBOOT_BUILTIN_KEY` | **否** | 需 PSA Crypto 硬件支持，密钥完全由平台管理 |
+| SHA-512 (curve25519) | **否** | 自动用 `ext/tinycrypt-sha512` 替代 |
+| SHA-256 (镜像哈希) | **否** | 走 Tinycrypt 的 `tc_sha256_*` |
+
+#### 完全零 Mbed TLS 的最优配置
+
+```c
+#define MCUBOOT_USE_TINYCRYPT              // SHA-256 由 Tinycrypt 提供
+#define MCUBOOT_SIGN_ED25519               // 签名由 fiat-crypto 独立实现
+#define MCUBOOT_KEY_IMPORT_BYPASS_ASN      // 去掉 Mbed TLS ASN.1 依赖
+#define MCUBOOT_OVERWRITE_ONLY             // 裁剪 swap 代码
 ```
 
 **构建系统添加：**
 ```makefile
-SRC += ext/fiat/src/curve25519.c         # 提供 ED25519_verify()
-SRC += boot/bootutil/src/image_ed25519.c # ED25519 签名验证胶水代码
+SRC += ext/fiat/src/curve25519.c               # ED25519 数学 (fiat-crypto)
+SRC += ext/tinycrypt-sha512/lib/source/sha512.c # SHA-512 (Tinycrypt 扩展)
+SRC += boot/bootutil/src/image_ed25519.c       # 签名验证胶水
 # 不需要 image_ecdsa.c, image_rsa.c
-# 不需要 Mbed TLS 的任何 .a 文件
+# 不需要 Mbed TLS 的任何 .a 或 .c
 ```
+
+**`keys.c` 公钥格式：** 仍然用 `imgtool getpub -k mykey.pem` 生成 C 数组，但 bypass 路径会自动取末尾 32 字节作为原始公钥，无需手动处理。
 
 **三种方案对比：**
 
-| 方案 | SHA-256 | 签名 | Flash | RAM | 验证速度 (Cortex-M0+) |
-|------|---------|------|-------|-----|----------------------|
-| Mbed TLS + ECDSA | Mbed TLS | Mbed TLS | ~30KB | ~3KB | 慢 (~1-2s) |
-| Tinycrypt + ECDSA | Tinycrypt | uECC | ~18KB | ~1.5KB | 中等 (~0.5s) |
-| **Tinycrypt + ED25519** | Tinycrypt | fiat-crypto | **~20KB** | **~2KB** | **快 (~0.15s)** |
+| 方案 | SHA-256 | 签名 | Flash | RAM | 验证速度 (Cortex-M0+) | Mbed TLS 依赖 |
+|------|---------|------|-------|-----|----------------------|:---:|
+| Mbed TLS + ECDSA | Mbed TLS | Mbed TLS | ~30KB | ~3KB | 慢 (~1-2s) | 全部 |
+| Tinycrypt + ECDSA | Tinycrypt | uECC | ~18KB | ~1.5KB | 中等 (~0.5s) | 无 |
+| **Tinycrypt + ED25519 + BYPASS_ASN** | Tinycrypt | fiat-crypto | **~20KB** | **~2KB** | **快 (~0.15s)** | **无** |
 
 **注意事项：**
-1. ED25519 公钥是 32 字节原始格式（非 DER），`keys.c` 中格式与 ECDSA 不同
-2. 用 `imgtool keygen -k mykey.pem -t ed25519` 生成密钥
-3. 用 `imgtool getpub -k mykey.pem` 获取 C 数组格式公钥
-4. fiat-crypto 代码是自动生成的，可读性差但经过形式化验证
-5. Tinycrypt 不支持镜像加密，如果你需要加密功能需要换 Mbed TLS 或自实现 backend
+1. 不定义 `MCUBOOT_KEY_IMPORT_BYPASS_ASN` 时，默认路径会拖入 Mbed TLS ASN.1 代码（~3-5KB Flash）
+2. ED25519 公钥是 32 字节原始格式（非 DER），`keys.c` 中格式与 ECDSA 不同
+3. 用 `imgtool keygen -k mykey.pem -t ed25519` 生成密钥
+4. fiat-crypto 代码经过形式化验证，安全性不输 Mbed TLS，但可读性差
+5. Tinycrypt 不支持镜像加密，如果同时需要 ED25519 和加密，需自实现 `boot_enc_*` 接口
 
 ### Q3: boot_go() 返回后如何跳转到用户应用?
 
